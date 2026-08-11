@@ -1,0 +1,193 @@
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class MTRDecoder(nn.Module):
+    """
+    Agent 轨迹解码器。
+    约束：forward 的输入只有 agent_features（对 agent (x,y) 历史序列的高维特征表示）
+    和 agent_cur_pos（当前 (x,y) 绝对坐标），不引入其它显式状态。
+    减速特征处理：预测 (加速度, 横摆角速度) 控制量，做运动学积分生成轨迹，
+    速度用 clamp(v, min=0) 截断——急刹车时速度快速趋零，轨迹长度随之快速收缩。
+    """
+    def __init__(self, in_channels, config):
+        super().__init__()
+        self.future_steps = 75
+        self.dt = config.get('dt', 0.1)
+        self.num_modes = config.get('num_modes', 6)
+        self.d_model = config.get('d_model', 256)
+        self.num_layers = config.get('num_decoder_layers', 3)
+        self.num_heads = config.get('num_heads', 8)
+        self.max_accel = config.get('max_accel', 6.0)        # m/s^2，含刹车方向
+        self.max_yaw_rate = config.get('max_yaw_rate', 0.5)  # rad/s
+        self.pos_fourier_freq = config.get('num_fourier_freq', 8)
+        self.offset_scale = config.get('offset_scale', 1.0)  # 残差修正上限(米)
+
+        # 高维 (x,y) 特征 -> d_model
+        self.input_proj = nn.Linear(in_channels, self.d_model)
+
+        # 从 agent_features 推断当前速度/朝向（不依赖显式状态输入）
+        self.kinematic_head = nn.Sequential(
+            nn.Linear(self.d_model, self.d_model // 2), nn.ReLU(inplace=True),
+            nn.Linear(self.d_model // 2, 3)   # -> [v0_raw, cos(theta0), sin(theta0)]
+        )
+
+        # K 个模式 query：仅由锚点坐标(x,y)做傅里叶编码 + MLP 得到，不掺入历史语义特征
+        self.mode_embed = nn.Parameter(torch.randn(self.num_modes, self.d_model) * 0.02)
+        fourier_dim = self.pos_fourier_freq * 4
+        self.anchor_embed_mlp = nn.Sequential(
+            nn.Linear(fourier_dim, self.d_model), nn.ReLU(inplace=True),
+            nn.Linear(self.d_model, self.d_model)
+        )
+        self.anchor_points = nn.Parameter(torch.randn(self.num_modes, 2) * 5.0)
+
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=self.d_model, nhead=self.num_heads,
+            dim_feedforward=self.d_model * 4, dropout=0.1, batch_first=True
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=self.num_layers)
+
+        # 逐步自回归解码控制量
+        self.control_gru = nn.GRUCell(self.d_model, self.d_model)
+        self.control_head = nn.Sequential(
+            nn.Linear(self.d_model, self.d_model // 2), nn.ReLU(inplace=True),
+            nn.Linear(self.d_model // 2, 2)   # -> [accel_raw, yaw_rate_raw]
+        )
+        # 对纯运动学积分做小幅残差修正，弥补建模误差，不破坏减速趋势
+        self.offset_head = nn.Sequential(
+            nn.Linear(self.d_model, self.d_model // 2), nn.ReLU(inplace=True),
+            nn.Linear(self.d_model // 2, 2)
+        )
+        self.score_head = nn.Sequential(
+            nn.Linear(self.d_model, self.d_model // 2), nn.ReLU(inplace=True),
+            nn.Linear(self.d_model // 2, 1)
+        )
+
+    def _fourier_pos_embed(self, xy):
+        freqs = 2 ** torch.arange(self.pos_fourier_freq, device=xy.device).float()
+        xy_scaled = xy.unsqueeze(-1) * freqs * math.pi
+        emb = torch.cat([xy_scaled.sin(), xy_scaled.cos()], dim=-1)
+        return emb.flatten(-2)
+
+    def forward(self, agent_features, agent_cur_pos):
+        """
+        agent_features: [B, N, C]  agent (x,y) 历史序列的高维特征表示（decoder 唯一特征输入）
+        agent_cur_pos:  [B, N, 2]  当前时刻绝对坐标
+        return:
+            pred_trajs:  [B, N, K, future_steps, 2]
+            pred_scores: [B, N, K]
+            pred_vel:    [B, N, K, future_steps]  预测速度轮廓，供 loss 监督减速特征
+        """
+        B, N, _ = agent_features.shape
+        K, T = self.num_modes, self.future_steps
+
+        memory = self.input_proj(agent_features)                     # [B, N, D]
+
+        kin = self.kinematic_head(memory)                              # [B, N, 3]
+        v0 = F.softplus(kin[..., 0])                                    # 速度非负
+        heading0 = torch.atan2(kin[..., 2], kin[..., 1])
+
+        anchor_emb = self.anchor_embed_mlp(self._fourier_pos_embed(self.anchor_points))  # [K, D]
+        query = anchor_emb.unsqueeze(0).unsqueeze(0) + self.mode_embed.unsqueeze(0).unsqueeze(0)
+        query = query.expand(B, N, K, -1).reshape(B * N, K, -1)
+        mem = memory.reshape(B * N, 1, -1)
+
+        query = self.decoder(tgt=query, memory=mem)                    # [B*N, K, D]
+
+        v0_flat = v0.reshape(B * N, 1).expand(-1, K).reshape(-1)
+        heading_flat = heading0.reshape(B * N, 1).expand(-1, K).reshape(-1)
+        cur_pos_flat = agent_cur_pos.reshape(B * N, 1, 2).expand(-1, K, -1).reshape(-1, 2)
+
+        hidden = query.reshape(B * N * K, -1)
+        step_input = hidden
+        v_t, theta_t, pos_t = v0_flat, heading_flat, cur_pos_flat
+        positions, velocities = [], []
+
+        for _ in range(T):
+            hidden = self.control_gru(step_input, hidden)
+            ctrl = self.control_head(hidden)
+            accel = torch.tanh(ctrl[..., 0]) * self.max_accel           # 允许负值 -> 刹车
+            yaw_rate = torch.tanh(ctrl[..., 1]) * self.max_yaw_rate
+
+            v_t = torch.clamp(v_t + accel * self.dt, min=0.0)           # 急刹车 -> v 快速趋零
+            theta_t = theta_t + yaw_rate * self.dt
+            step_disp = torch.stack([torch.cos(theta_t), torch.sin(theta_t)], dim=-1) * (v_t * self.dt).unsqueeze(-1)
+
+            offset = torch.tanh(self.offset_head(hidden)) * self.offset_scale
+            pos_t = pos_t + step_disp + offset
+
+            positions.append(pos_t)
+            velocities.append(v_t)
+            step_input = hidden
+
+        pred_trajs = torch.stack(positions, dim=1).reshape(B, N, K, T, 2)
+        pred_vel = torch.stack(velocities, dim=1).reshape(B, N, K, T)
+        pred_scores = self.score_head(query).squeeze(-1).reshape(B, N, K)
+
+        return {'pred_trajs': pred_trajs, 'pred_scores': pred_scores, 'pred_vel': pred_vel}
+
+
+class AgentTrajectoryLoss(nn.Module):
+    """
+    Agent 轨迹预测损失。
+    - winner-takes-all 回归 + 分类
+    - 减速片段（GT 加速度显著为负）位置误差加权，逼迫模型学准刹车轮廓
+    - 显式速度监督损失，直接约束预测速度曲线贴近 GT
+    """
+    def __init__(self, config=None):
+        super().__init__()
+        config = config or {}
+        self.reg_weight = config.get('reg_weight', 1.0)
+        self.cls_weight = config.get('cls_weight', 1.0)
+        self.vel_weight = config.get('vel_weight', 1.0)
+        self.decel_weight = config.get('decel_weight', 2.0)
+        self.decel_accel_thresh = config.get('decel_accel_thresh', -1.0)  # m/s^2
+        self.dt = config.get('dt', 0.1)
+
+    @staticmethod
+    def _ade(pred_trajs, gt_traj, gt_mask):
+        dist = torch.norm(pred_trajs - gt_traj.unsqueeze(2), dim=-1)      # [B, N, K, T]
+        dist = dist * gt_mask.unsqueeze(2)
+        denom = gt_mask.sum(dim=-1).clamp(min=1.0).unsqueeze(2)
+        return dist.sum(dim=-1) / denom                                    # [B, N, K]
+
+    def forward(self, pred_dict, gt_traj, gt_mask):
+        """
+        pred_dict: MTRDecoder 输出 {'pred_trajs','pred_scores','pred_vel'}
+        gt_traj:   [B, N, T, 2]  未来真值轨迹（与 pred_trajs 同坐标系）
+        gt_mask:   [B, N, T]     有效步 mask
+        """
+        pred_trajs, pred_scores, pred_vel = pred_dict['pred_trajs'], pred_dict['pred_scores'], pred_dict['pred_vel']
+        B, N, K, T, _ = pred_trajs.shape
+
+        ade = self._ade(pred_trajs, gt_traj, gt_mask)
+        best_mode = ade.argmin(dim=-1)                                     # [B, N]
+        idx = best_mode.view(B, N, 1, 1, 1).expand(-1, -1, 1, T, 2)
+        best_traj = pred_trajs.gather(2, idx).squeeze(2)                   # [B, N, T, 2]
+
+        # GT 速度/加速度（有限差分），用于减速片段加权
+        gt_vel = torch.zeros_like(gt_traj[..., 0])
+        gt_vel[:, :, 1:] = torch.norm(gt_traj[:, :, 1:] - gt_traj[:, :, :-1], dim=-1) / self.dt
+        gt_vel[:, :, 0] = gt_vel[:, :, 1]
+        gt_accel = torch.zeros_like(gt_vel)
+        gt_accel[:, :, 1:] = (gt_vel[:, :, 1:] - gt_vel[:, :, :-1]) / self.dt
+
+        decel_mask = (gt_accel < self.decel_accel_thresh).float()
+        step_weight = 1.0 + self.decel_weight * decel_mask                 # 减速片段加权
+
+        reg_err = F.smooth_l1_loss(best_traj, gt_traj, reduction='none').sum(dim=-1)
+        reg_err = reg_err * gt_mask * step_weight
+        denom = (gt_mask * step_weight).sum().clamp(min=1.0)
+        loss_reg = reg_err.sum() / denom
+
+        best_vel = pred_vel.gather(2, best_mode.view(B, N, 1, 1).expand(-1, -1, 1, T)).squeeze(2)
+        vel_err = F.smooth_l1_loss(best_vel, gt_vel, reduction='none') * gt_mask * step_weight
+        loss_vel = vel_err.sum() / denom
+
+        loss_cls = F.cross_entropy(pred_scores.reshape(B * N, K), best_mode.reshape(B * N))
+
+        total = self.reg_weight * loss_reg + self.vel_weight * loss_vel + self.cls_weight * loss_cls
+        return {'loss': total, 'loss_reg': loss_reg.detach(),
+                'loss_vel': loss_vel.detach(), 'loss_cls': loss_cls.detach()}
